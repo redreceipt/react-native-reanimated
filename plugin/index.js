@@ -596,19 +596,30 @@ __export(processIfWorkletNode_exports, {
   processIfWorkletNode: () => processIfWorkletNode
 });
 function processIfWorkletNode(fun, state) {
+  let shouldBeProcessed = false;
   fun.traverse({
     DirectiveLiteral(path) {
       const value = path.node.value;
-      if (value === "worklet" && path.getFunctionParent() === fun && (0, import_types5.isBlockStatement)(fun.node.body)) {
-        const directives = fun.node.body.directives;
-        if (directives && directives.length > 0 && directives.some(
-          (directive) => (0, import_types5.isDirectiveLiteral)(directive.value) && directive.value.value === "worklet"
-        )) {
-          processIfWorkletFunction(fun, state);
+      if (value === "worklet" && (0, import_types5.isBlockStatement)(fun.node.body)) {
+        const parent = path.getFunctionParent();
+        if (parent === fun) {
+          const directives = fun.node.body.directives;
+          if (directives && directives.length > 0 && directives.some(
+            (directive) => (0, import_types5.isDirectiveLiteral)(directive.value) && directive.value.value === "worklet"
+          )) {
+            shouldBeProcessed = true;
+          }
+        } else if (state.opts.useOnExitLogicForWorkletNodes && ((0, import_types5.isFunctionDeclaration)(parent) || (0, import_types5.isFunctionExpression)(parent) || (0, import_types5.isArrowFunctionExpression)(parent))) {
+          processIfWorkletNode(
+            parent,
+            state
+          );
         }
       }
     }
   });
+  if (shouldBeProcessed)
+    processIfWorkletFunction(fun, state);
 }
 var import_types5;
 var init_processIfWorkletNode = __esm({
