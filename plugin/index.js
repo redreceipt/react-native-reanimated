@@ -1,11 +1,9 @@
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-const BabelTypes = require("@babel/types");
-const generator_1 = require("@babel/generator");
-const traverse_1 = require("@babel/traverse");
-const core_1 = require("@babel/core");
-const fs = require("fs");
-const convertSourceMap = require("convert-source-map");
+import * as BabelTypes from '@babel/types';
+import generate from '@babel/generator';
+import traverse from '@babel/traverse';
+import { transformSync } from '@babel/core';
+import * as fs from 'fs';
+import * as convertSourceMap from 'convert-source-map';
 function hash(str) {
     let i = str.length;
     let hash1 = 5381;
@@ -17,6 +15,9 @@ function hash(str) {
     }
     return (hash1 >>> 0) * 4096 + (hash2 >>> 0);
 }
+/**
+ * holds a map of function names as keys and array of argument indexes as values which should be automatically workletized(they have to be functions)(starting from 0)
+ */
 const functionArgsToWorkletize = new Map([
     ['useFrameCallback', [0]],
     ['useAnimatedStyle', [0]],
@@ -26,6 +27,7 @@ const functionArgsToWorkletize = new Map([
     ['useAnimatedScrollHandler', [0]],
     ['useAnimatedReaction', [0, 1]],
     ['useWorkletCallback', [0]],
+    // animations' callbacks
     ['withTiming', [2]],
     ['withSpring', [2]],
     ['withDecay', [1]],
@@ -63,7 +65,6 @@ const globals = new Set([
     'UIManager',
     'requestAnimationFrame',
     'setImmediate',
-    'queueMicrotask',
     '_WORKLET',
     'arguments',
     'Boolean',
@@ -96,6 +97,7 @@ const globals = new Set([
     '_notifyAboutEnd',
 ]);
 const gestureHandlerGestureObjects = new Set([
+    // from https://github.com/software-mansion/react-native-gesture-handler/blob/new-api/src/handlers/gestures/gestureObjects.ts
     'Tap',
     'Pan',
     'Pinch',
@@ -130,6 +132,8 @@ function shouldGenerateSourceMap() {
         return false;
     }
     if (process.env.REANIMATED_PLUGIN_TESTS === 'jest') {
+        // We want to detect this, so we can disable source maps (because they break
+        // snapshot tests with jest).
         return false;
     }
     return true;
@@ -181,17 +185,20 @@ function buildWorkletString(t, fun, closureVariables, name, inputMap) {
     if (!('params' in expression && BabelTypes.isBlockStatement(expression.body)))
         throw new Error("'expression' doesn't have property 'params' or 'expression.body' is not a BlockStatmenent\n'");
     const workletFunction = BabelTypes.functionExpression(BabelTypes.identifier(name), expression.params, expression.body);
-    const code = (0, generator_1.default)(workletFunction).code;
+    const code = generate(workletFunction).code;
     if (!inputMap)
         throw new Error("'inputMap' is not defined");
     const includeSourceMap = shouldGenerateSourceMap();
     if (includeSourceMap) {
+        // Clear contents array (should be empty anyways)
         inputMap.sourcesContent = [];
+        // Include source contents in source map, because Flipper/iframe is not
+        // allowed to read files from disk.
         for (const sourceFile of inputMap.sources) {
             inputMap.sourcesContent.push(fs.readFileSync(sourceFile).toString('utf-8'));
         }
     }
-    const transformed = (0, core_1.transformSync)(code, {
+    const transformed = transformSync(code, {
         plugins: [prependClosureVariablesIfNecessary()],
         compact: !includeSourceMap,
         sourceMaps: includeSourceMap,
@@ -206,6 +213,10 @@ function buildWorkletString(t, fun, closureVariables, name, inputMap) {
     let sourceMap;
     if (includeSourceMap) {
         sourceMap = convertSourceMap.fromObject(transformed.map).toObject();
+        // sourcesContent field contains a full source code of the file which contains the worklet
+        // and is not needed by the source map interpreter in order to symbolicate a stack trace.
+        // Therefore, we remove it to reduce the bandwith and avoid sending it potentially multiple times
+        // in files that contain multiple worklets. Along with sourcesContent.
         delete sourceMap.sourcesContent;
     }
     return [transformed.code, JSON.stringify(sourceMap)];
@@ -221,11 +232,14 @@ function makeWorkletName(t, fun) {
         BabelTypes.isIdentifier(fun.node.id)) {
         return fun.node.id.name;
     }
-    return 'anonymous';
+    return 'anonymous'; // fallback for ArrowFunctionExpression and unnamed FunctionExpression
 }
 function makeWorklet(t, fun, state) {
+    // Returns a new FunctionExpression which is a workletized version of provided
+    // FunctionDeclaration, FunctionExpression, ArrowFunctionExpression or ObjectMethod.
     const functionName = makeWorkletName(t, fun);
     const closure = new Map();
+    // remove 'worklet'; directive before generating string
     fun.traverse({
         DirectiveLiteral(path) {
             if (path.node.value === 'worklet' && path.getFunctionParent() === fun) {
@@ -233,14 +247,20 @@ function makeWorklet(t, fun, state) {
             }
         },
     });
+    // We use copy because some of the plugins don't update bindings and
+    // some even break them
     if (!state.file.opts.filename)
         throw new Error("'state.file.opts.filename' is undefined\n");
-    const codeObject = (0, generator_1.default)(fun.node, {
+    const codeObject = generate(fun.node, {
         sourceMaps: true,
         sourceFileName: state.file.opts.filename,
     });
+    // We need to add a newline at the end, because there could potentially be a
+    // comment after the function that gets included here, and then the closing
+    // bracket would become part of the comment thus resulting in an error, since
+    // there is a missing closing bracket.
     const code = '(' + (t.isObjectMethod(fun) ? 'function ' : '') + codeObject.code + '\n)';
-    const transformed = (0, core_1.transformSync)(code, {
+    const transformed = transformSync(code, {
         filename: state.file.opts.filename,
         presets: ['@babel/preset-typescript'],
         plugins: [
@@ -257,7 +277,7 @@ function makeWorklet(t, fun, state) {
     });
     if (!transformed || !transformed.ast)
         throw new Error("'transformed' or 'transformed.ast' is undefined\n");
-    (0, traverse_1.default)(transformed.ast, {
+    traverse(transformed.ast, {
         Identifier(path) {
             if (!path.isReferencedIdentifier())
                 return;
@@ -302,17 +322,24 @@ function makeWorklet(t, fun, state) {
     const workletHash = hash(funString);
     let location = state.file.opts.filename;
     if (state.opts.relativeSourceLocation) {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
         const path = require('path');
         location = path.relative(state.cwd, location);
     }
     let lineOffset = 1;
     if (closure.size > 0) {
+        // When worklet captures some variables, we append closure destructing at
+        // the beginning of the function body. This effectively results in line
+        // numbers shifting by the number of captured variables (size of the
+        // closure) + 2 (for the opening and closing brackets of the destruct
+        // statement)
         lineOffset -= closure.size + 2;
     }
     const pathForStringDefinitions = fun.parentPath.isProgram()
         ? fun
-        : fun.findParent((path) => path.parentPath.isProgram());
-    const initDataId = pathForStringDefinitions.parentPath.scope
+        : fun.findParent((path) => path.parentPath.isProgram() // this causes typescript error on Windows CI build
+        ); // this causes typescript error on Windows CI build
+    const initDataId = pathForStringDefinitions.parentPath.scope // this causes typescript error on Windows CI build
         .generateUidIdentifier(`worklet_${workletHash}_init_data`);
     const initDataObjectExpression = t.objectExpression([
         t.objectProperty(t.identifier('code'), t.stringLiteral(funString)),
@@ -346,15 +373,24 @@ function makeWorklet(t, fun, state) {
         statements.push(t.expressionStatement(t.assignmentExpression('=', t.memberExpression(privateFunctionId, t.identifier('__stackDetails'), false), t.identifier('_e'))));
     }
     statements.push(t.returnStatement(privateFunctionId));
-    const newFun = t.functionExpression(undefined, [], t.blockStatement(statements));
+    const newFun = t.functionExpression(
+    // !BabelTypes.isArrowFunctionExpression(fun.node) ? fun.node.id : undefined, // [TO DO] --- this never worked
+    undefined, [], t.blockStatement(statements));
     return newFun;
 }
 function processWorkletFunction(t, fun, state) {
+    // Replaces FunctionDeclaration, FunctionExpression or ArrowFunctionExpression
+    // with a workletized version of itself.
     if (!t.isFunctionParent(fun)) {
         return;
     }
     const newFun = makeWorklet(t, fun, state);
     const replacement = t.callExpression(newFun, []);
+    // we check if function needs to be assigned to variable declaration.
+    // This is needed if function definition directly in a scope. Some other ways
+    // where function definition can be used is for example with variable declaration:
+    // const ggg = function foo() { }
+    // ^ in such a case we don't need to define variable for the function
     const needDeclaration = t.isScopable(fun.parent) || t.isExportNamedDeclaration(fun.parent);
     fun.replaceWith(!BabelTypes.isArrowFunctionExpression(fun.node) &&
         fun.node.id &&
@@ -365,6 +401,7 @@ function processWorkletFunction(t, fun, state) {
         : replacement);
 }
 function processWorkletObjectMethod(t, path, state) {
+    // Replaces ObjectMethod with a workletized version of itself.
     if (!BabelTypes.isFunctionParent(path))
         return;
     const newFun = makeWorklet(t, path, state);
@@ -378,6 +415,9 @@ function processIfWorkletNode(t, fun, state) {
             if (value === 'worklet' &&
                 path.getFunctionParent() === fun &&
                 BabelTypes.isBlockStatement(fun.node.body)) {
+                // make sure "worklet" is listed among directives for the fun
+                // this is necessary as because of some bug, babel will attempt to
+                // process replaced function if it is nested inside another function
                 const directives = fun.node.body.directives;
                 if (directives &&
                     directives.length > 0 &&
@@ -390,6 +430,51 @@ function processIfWorkletNode(t, fun, state) {
     });
 }
 function processIfGestureHandlerEventCallbackFunctionNode(t, fun, state) {
+    // Auto-workletizes React Native Gesture Handler callback functions.
+    // Detects `Gesture.Tap().onEnd(<fun>)` or similar, but skips `something.onEnd(<fun>)`.
+    // Supports method chaining as well, e.g. `Gesture.Tap().onStart(<fun1>).onUpdate(<fun2>).onEnd(<fun3>)`.
+    // Example #1: `Gesture.Tap().onEnd(<fun>)`
+    /*
+    CallExpression(
+      callee: MemberExpression(
+        object: CallExpression(
+          callee: MemberExpression(
+            object: Identifier('Gesture')
+            property: Identifier('Tap')
+          )
+        )
+        property: Identifier('onEnd')
+      )
+      arguments: [fun]
+    )
+    */
+    // Example #2: `Gesture.Tap().onStart(<fun1>).onUpdate(<fun2>).onEnd(<fun3>)`
+    /*
+    CallExpression(
+      callee: MemberExpression(
+        object: CallExpression(
+          callee: MemberExpression(
+            object: CallExpression(
+              callee: MemberExpression(
+                object: CallExpression(
+                  callee: MemberExpression(
+                    object: Identifier('Gesture')
+                    property: Identifier('Tap')
+                  )
+                )
+                property: Identifier('onStart')
+              )
+              arguments: [fun1]
+            )
+            property: Identifier('onUpdate')
+          )
+          arguments: [fun2]
+        )
+        property: Identifier('onEnd')
+      )
+      arguments: [fun3]
+    )
+    */
     if (t.isCallExpression(fun.parent) &&
         t.isExpression(fun.parent.callee) &&
         isGestureObjectEventCallbackMethod(t, fun.parent.callee)) {
@@ -397,15 +482,21 @@ function processIfGestureHandlerEventCallbackFunctionNode(t, fun, state) {
     }
 }
 function isGestureObjectEventCallbackMethod(t, node) {
+    // Checks if node matches the pattern `Gesture.Foo()[*].onBar`
+    // where `[*]` represents any number of method calls.
     return (t.isMemberExpression(node) &&
         t.isIdentifier(node.property) &&
         gestureHandlerBuilderMethods.has(node.property.name) &&
         containsGestureObject(t, node.object));
 }
 function containsGestureObject(t, node) {
+    // Checks if node matches the pattern `Gesture.Foo()[*]`
+    // where `[*]` represents any number of chained method calls, like `.something(42)`.
+    // direct call
     if (isGestureObject(t, node)) {
         return true;
     }
+    // method chaining
     if (t.isCallExpression(node) &&
         t.isMemberExpression(node.callee) &&
         containsGestureObject(t, node.callee.object)) {
@@ -414,6 +505,15 @@ function containsGestureObject(t, node) {
     return false;
 }
 function isGestureObject(t, node) {
+    // Checks if node matches `Gesture.Tap()` or similar.
+    /*
+    node: CallExpression(
+      callee: MemberExpression(
+        object: Identifier('Gesture')
+        property: Identifier('Tap')
+      )
+    )
+    */
     return (t.isCallExpression(node) &&
         t.isMemberExpression(node.callee) &&
         t.isIdentifier(node.callee.object) &&
@@ -430,6 +530,7 @@ function processWorklets(t, path, state) {
         name = callee.name;
     else if ('property' in callee && 'name' in callee.property)
         name = callee.property.name;
+    // else name = 'anonymous'; --- might add it in the future [TO DO]
     if (objectHooks.has(name) &&
         BabelTypes.isObjectExpression(path.get('arguments.0').node)) {
         const properties = path.get('arguments.0.properties');
@@ -439,7 +540,7 @@ function processWorklets(t, path, state) {
             }
             else {
                 const value = property.get('value');
-                processWorkletFunction(t, value, state);
+                processWorkletFunction(t, value, state); // temporarily given 3 types [TO DO]
             }
         }
     }
@@ -447,12 +548,13 @@ function processWorklets(t, path, state) {
         const indexes = functionArgsToWorkletize.get(name);
         if (Array.isArray(indexes)) {
             indexes.forEach((index) => {
-                processWorkletFunction(t, path.get(`arguments.${index}`), state);
+                processWorkletFunction(t, path.get(`arguments.${index}`), state); // temporarily given 3 types [TO DO]
             });
         }
     }
 }
 function generateInlineStylesWarning(t, memberExpression) {
+    // replaces `sharedvalue.value` with `(()=>{console.warn(require('react-native-reanimated').getUseOfValueInStyleWarning());return sharedvalue.value;})()`
     return t.callExpression(t.arrowFunctionExpression([], t.blockStatement([
         t.expressionStatement(t.callExpression(t.memberExpression(t.identifier('console'), t.identifier('warn')), [
             t.callExpression(t.memberExpression(t.callExpression(t.identifier('require'), [
@@ -463,6 +565,7 @@ function generateInlineStylesWarning(t, memberExpression) {
     ])), []);
 }
 function processPropertyValueForInlineStylesWarning(t, path) {
+    // if it's something like object.value then raise a warning
     if (t.isMemberExpression(path.node) && t.isIdentifier(path.node.property)) {
         if (path.node.property.name === 'value') {
             path.replaceWith(generateInlineStylesWarning(t, path));
@@ -474,7 +577,7 @@ function processTransformPropertyForInlineStylesWarning(t, path) {
         const elements = path.get('elements');
         for (const element of elements) {
             if (t.isObjectExpression(element.node)) {
-                processStyleObjectForInlineStylesWarning(t, element);
+                processStyleObjectForInlineStylesWarning(t, element); // why is it not inferred? [TO DO]
             }
         }
     }
@@ -508,21 +611,24 @@ function processInlineStylesWarning(t, path, state) {
     const expression = path
         .get('value')
         .get('expression');
+    // style={[{...}, {...}]}
     if (BabelTypes.isArrayExpression(expression.node)) {
         const elements = expression.get('elements');
         for (const element of elements) {
             if (t.isObjectExpression(element.node)) {
-                processStyleObjectForInlineStylesWarning(t, element);
+                processStyleObjectForInlineStylesWarning(t, element); // why is it not inferred? [TO DO]
             }
         }
     }
+    // style={{...}}
     else if (t.isObjectExpression(expression.node)) {
-        processStyleObjectForInlineStylesWarning(t, expression);
+        processStyleObjectForInlineStylesWarning(t, expression); // why is it not inferred? [TO DO]
     }
 }
 module.exports = function ({ types: t, }) {
     return {
         pre() {
+            // allows adding custom globals such as host-functions
             if (this.opts != null && Array.isArray(this.opts.globals)) {
                 this.opts.globals.forEach((name) => {
                     globals.add(name);
@@ -549,4 +655,3 @@ module.exports = function ({ types: t, }) {
         },
     };
 };
-//# sourceMappingURL=index.js.map
