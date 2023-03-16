@@ -6,6 +6,7 @@
     "@types/convert-source-map": "^2.0.0",
     "@types/node": "^18.15.3",
     "eslint": "^8.35.0",
+    "fs": "^0.0.1-security",
     "prettier": "^2.5.1",
     "typescript": "^4.1.3"
   },
