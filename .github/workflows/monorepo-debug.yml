@@ -19,14 +19,14 @@ jobs:
       - name: Create PackageApp
         working-directory: monorepo/packages
         run: npx react-native@next init PackageApp --skip-install
-      
+
       - name: Install dependencies for RootApp
         working-directory: monorepo/RootApp
         run: yarn add github:software-mansion/react-native-reanimated#${{ github.ref }}
       - name: Install dependencies for PackageApp
         working-directory: monorepo/packages/PackageApp
         run: yarn add github:software-mansion/react-native-reanimated#${{ github.ref }}
-      
+
       - name: Setup hoisted Reanimated
         working-directory: monorepo
         run: yarn add github:software-mansion/react-native-reanimated#${{ github.ref }} -W
@@ -38,6 +38,8 @@ jobs:
         working-directory: monorepo/packages/PackageApp/ios
         run: pod install
 
+      - name: Setup tmate session
+        uses: mxschmitt/action-tmate@v3
       - name: Build iOS app RootApp
         working-directory: monorepo/RootApp
         run: yarn react-native run-ios
