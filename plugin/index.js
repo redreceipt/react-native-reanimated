@@ -5,7 +5,7 @@ const generator_1 = require("@babel/generator");
 const traverse_1 = require("@babel/traverse");
 const core_1 = require("@babel/core");
 const fs = require("fs");
-const convertSourceMap = require("convert-source-map");
+const convertSourceMap = require("convert-source-map"); //
 function hash(str) {
     let i = str.length;
     let hash1 = 5381;
