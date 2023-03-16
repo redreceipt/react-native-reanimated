@@ -38,8 +38,6 @@ jobs:
         working-directory: monorepo/packages/PackageApp/ios
         run: pod install
 
-      - name: Setup upterm session
-        uses: mxschmitt/action-tmate@v3
       - name: Build iOS app RootApp
         working-directory: monorepo/RootApp
         run: yarn react-native run-ios
